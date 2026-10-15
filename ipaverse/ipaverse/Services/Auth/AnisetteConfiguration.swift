@@ -22,7 +22,9 @@ struct AnisetteConfiguration: Equatable, Sendable {
 
     static let modeKey = "anisette.mode"
     static let serverKey = "anisette.serverURL"
-    static let defaultServer = "https://ani.sidestore.zip"
+    // A Windows-based V3 server. As of October 2026, GSA rejects anisette data from
+    // Android-based servers such as ani.sidestore.zip (iloader 2.3.8 made the same switch).
+    static let defaultServer = "https://ani.jkcoxson.com"
     let mode: Mode
     let server: String
 
