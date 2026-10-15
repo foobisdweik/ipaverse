@@ -45,6 +45,9 @@ final class AppStoreService: AppStoreServiceProtocol {
         var isVerified = false
     }
     private var pendingGSATwoFactor: PendingGSATwoFactor?
+    /// Email of a sign-in whose App Store step (MZFinance) asked for a verification code.
+    /// GSA can already trust the device while MZFinance still asks for its own code.
+    private var pendingStoreTwoFactorEmail: String?
 
     init(session: URLSession? = nil, isolatedCookies: Bool = false) {
         let config = isolatedCookies ? URLSessionConfiguration.ephemeral : URLSessionConfiguration.default
@@ -69,9 +72,10 @@ final class AppStoreService: AppStoreServiceProtocol {
 
     // MARK: - Login
     //
-    // Apple deprecated the legacy MZFinance username/password authenticate endpoint
-    // (now returns 403). Auth now goes through GrandSlam (GSA) — an SRP-6a handshake
-    // against gsa.apple.com with local or explicitly configured V3 anisette headers. See GSAClient.
+    // Sign-in has two steps. First, GrandSlam (GSA), an SRP-6a handshake against
+    // gsa.apple.com with local or configured V3 anisette headers, verifies the account and
+    // trusts this device (see GSAClient). Second, MZFinance authenticate, with the password,
+    // any verification code, and an SAP signature, returns the App Store session.
     func login(credentials: LoginCredentials) async throws -> Account {
         let configuration = AnisetteConfiguration.load()
         let email = credentials.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -83,7 +87,12 @@ final class AppStoreService: AppStoreServiceProtocol {
                 throw LoginError.unknownError("Sign-in options or account changed. Go back and start sign-in again.")
             }
         }
-        if submittingCode && pendingGSATwoFactor == nil { throw LoginError.invalidAuthCode }
+        if pendingStoreTwoFactorEmail != nil && pendingStoreTwoFactorEmail != email {
+            pendingStoreTwoFactorEmail = nil
+        }
+        if submittingCode && pendingGSATwoFactor == nil && pendingStoreTwoFactorEmail == nil {
+            throw LoginError.invalidAuthCode
+        }
         let anisette: AnisetteSession
         if let pending = pendingGSATwoFactor {
             anisette = pending.anisette
@@ -109,7 +118,19 @@ final class AppStoreService: AppStoreServiceProtocol {
             )
             print("🔐 [GSA] handshake OK — dsid set: \(!gsaAccount.dsid.isEmpty), idmsToken set: \(!gsaAccount.idmsToken.isEmpty)")
             pendingGSATwoFactor = nil
-            return try await bridgeToAppStore(gsa: gsaAccount, credentials: credentials, anisette: anisette)
+            do {
+                let account = try await bridgeToAppStore(gsa: gsaAccount, credentials: credentials, anisette: anisette)
+                pendingStoreTwoFactorEmail = nil
+                return account
+            } catch let error as LoginError {
+                // The App Store asked for a code (or rejected the one sent). Accept the
+                // next code for this account even though GSA has nothing pending.
+                switch error {
+                case .twoFactorRequired, .invalidAuthCode: pendingStoreTwoFactorEmail = email
+                default: break
+                }
+                throw error
+            }
         } catch let GSAError.needsTwoFactor(identity, phoneId, maskedPhone) {
             pendingGSATwoFactor = PendingGSATwoFactor(identityToken: identity, phoneId: phoneId,
                                                      email: email, configuration: configuration, anisette: anisette)
@@ -154,19 +175,18 @@ final class AppStoreService: AppStoreServiceProtocol {
     /// (passwordToken / DSID / storeFront) that the download endpoints require.
     ///
     private func bridgeToAppStore(gsa: GSAAccountData, credentials: LoginCredentials, anisette: AnisetteSession) async throws -> Account {
-        // Bridge: use the password-equivalent token (PET) from the GrandSlam token
-        // table as the "password" for the MZFinance authenticate endpoint. The PET
-        // already encodes the GSA (2FA) authentication, so the store returns a
-        // passwordToken / DSID / storeFront without rejecting it like a raw password.
-        guard let tokens = gsa.raw["t"] as? [String: Any],
-              let petEntry = tokens["com.apple.gs.idms.pet"] as? [String: Any],
-              let pet = petEntry["token"] as? String, !pet.isEmpty else {
-            throw LoginError.unknownError("GSA OK but PET token (com.apple.gs.idms.pet) not found in spd")
-        }
-        print("🔐 [GSA] PET token len=\(pet.count) — authenticating to MZFinance with PET")
+        // MZFinance takes the account password with the verification code appended, as
+        // ipatool 2.7 sends it. In October 2026 MZFinance answered the GSA password-equivalent
+        // token (PET) only with empty 204/404 responses, while this method still worked.
+        // Without a code, MZFinance answers BadLogin and Apple sends a code to the
+        // trusted devices (parseLoginResponse turns that into `twoFactorRequired`).
+        let code = credentials.authCode?.replacingOccurrences(of: " ", with: "") ?? ""
+        print("🔐 [MZFinance] authenticating with password\(code.isEmpty ? "" : " + verification code")")
 
         let deviceID = try await getDeviceIdentifier()
-        let parsed = try await authenticateMZFinance(email: credentials.email, password: pet, deviceID: deviceID, anisette: anisette)
+        let parsed = try await authenticateMZFinance(email: credentials.email, password: credentials.password + code,
+                                                     authCode: code.isEmpty ? nil : code,
+                                                     deviceID: deviceID, anisette: anisette)
 
         let fallbackName = [gsa.raw["fn"] as? String, gsa.raw["ln"] as? String]
             .compactMap { $0 }.joined(separator: " ").trimmingCharacters(in: .whitespaces)
@@ -184,12 +204,14 @@ final class AppStoreService: AppStoreServiceProtocol {
         )
     }
 
-    /// Builds the legacy MZFinance authentication endpoint URL.
-    ///
-    /// The PET bridge uses the plist endpoint, with pod routing supplied by
+    /// Builds the MZFinance authentication endpoint URL, with pod routing supplied by
     /// validated Apple redirects. Transport retries keep the same endpoint/body.
-    private func authenticateURL(host: String, deviceID: String) -> String {
-        return "https://\(host)\(Constant.privateAppStoreAPIPathAuthenticate)?guid=\(deviceID)"
+    ///
+    /// The path ends with "/" and has no query, as in ipatool 2.7 (majd/ipatool f9aa653).
+    /// The bare path (and `?guid=`) answered with a 301 without Location, then 404 and an
+    /// empty 204, in October 2026. The GUID still travels in the request body.
+    private func authenticateURL(host: String) -> String {
+        return "https://\(host)\(Constant.privateAppStoreAPIPathAuthenticate)/"
     }
 
     // MARK: - Token Validation
@@ -697,7 +719,7 @@ final class AppStoreService: AppStoreServiceProtocol {
     /// since a 5005 has been observed to persist against a stale bag/pod pairing
     /// (see failureTypeTransientError). Bounded at 2 attempts total, matching
     /// GSAClient.send()'s retry budget for the equivalent GSA-side condition.
-    private func authenticateMZFinance(email: String, password: String, deviceID: String, anisette: AnisetteSession) async throws -> LoginParseResult {
+    private func authenticateMZFinance(email: String, password: String, authCode: String?, deviceID: String, anisette: AnisetteSession) async throws -> LoginParseResult {
         let maxAttempts = 2
         for attempt in 1...maxAttempts {
             // MZFinance now requires a signed X-Apple-ActionSignature header on
@@ -714,15 +736,15 @@ final class AppStoreService: AppStoreServiceProtocol {
             }
             defer { sapSigner.close() }
 
-            let urlString = authenticateURL(host: Constant.privateAppStoreAPIDomain, deviceID: deviceID)
+            let urlString = authenticateURL(host: Constant.privateAppStoreAPIDomain)
             guard let url = URL(string: urlString) else { throw LoginError.networkError }
             let request = try MZFinanceAuthentication.makeRequest(url: url, email: email, pet: password,
                                                                  deviceID: deviceID, userAgent: Constant.defaultUserAgent)
             let transport = AuthenticationHTTPTransport(session: session)
             let (data, response) = try await MZFinanceAuthentication.exchange(request: request) { request in
+                // No anisette headers: ipatool 2.7's password login sends none, and here they
+                // describe a Windows iTunes client that contradicts the Mac Configurator User-Agent.
                 var prepared = request
-                let headers = try await anisette.headers()
-                for (key, value) in headers { prepared.setValue(value, forHTTPHeaderField: key) }
                 guard let body = prepared.httpBody else { throw LoginError.networkError }
                 let signature = try sapSigner.sign(body)
                 prepared.setValue(signature.base64EncodedString(), forHTTPHeaderField: "X-Apple-ActionSignature")
@@ -734,7 +756,7 @@ final class AppStoreService: AppStoreServiceProtocol {
                 return (data, response)
             }
             let result = try parseLoginResponse(data: data, statusCode: response.statusCode,
-                                                authCode: nil, httpResponse: response)
+                                                authCode: authCode, httpResponse: response)
             if !result.shouldRetry { return result }
             guard attempt < maxAttempts else { break }
             print("🔐 [MZFinance] \(result.retryReason ?? "transient failure") on attempt \(attempt) — retrying with a fresh App Store signing session")
@@ -837,6 +859,12 @@ final class AppStoreService: AppStoreServiceProtocol {
     }
 
     private func getDeviceIdentifier() async throws -> String {
+        // ipatool 2.7 uses en0's hardware address from IOKit as the GUID. ifconfig can show
+        // a randomized or redacted address (02:00:00:00:00:00), but IOKit has the real one.
+        if let hardwareAddress = Self.primaryHardwareAddress() {
+            return hardwareAddress
+        }
+
         let task = Process()
         task.launchPath = "/sbin/ifconfig"
 
@@ -864,7 +892,9 @@ final class AppStoreService: AppStoreServiceProtocol {
             if line.contains("ether") {
                 let components = line.trimmingCharacters(in: .whitespaces).components(separatedBy: " ")
                 for component in components {
-                    if component.contains(":") && component.count == 17 {
+                    // ifconfig in this app has reported the placeholder 02:00:00:00:00:00 in place of
+                    // the real address. Every Mac would then send the same GUID, so skip it.
+                    if component.contains(":") && component.count == 17 && component != "02:00:00:00:00:00" {
                         return component.replacingOccurrences(of: ":", with: "").uppercased()
                     }
                 }
@@ -877,6 +907,23 @@ final class AppStoreService: AppStoreServiceProtocol {
         }
 
         return UUID().uuidString.replacingOccurrences(of: "-", with: "").uppercased()
+    }
+
+    /// en0's factory MAC address (`IOMACAddress` on its network controller) as 12 uppercase hex digits.
+    private static func primaryHardwareAddress() -> String? {
+        guard let matching = IOBSDNameMatching(kIOMainPortDefault, 0, "en0") else { return nil }
+        let interface = IOServiceGetMatchingService(kIOMainPortDefault, matching)
+        guard interface != 0 else { return nil }
+        defer { IOObjectRelease(interface) }
+        var controller: io_registry_entry_t = 0
+        guard IORegistryEntryGetParentEntry(interface, kIOServicePlane, &controller) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(controller) }
+        guard let address = IORegistryEntryCreateCFProperty(controller, "IOMACAddress" as CFString,
+                                                            kCFAllocatorDefault, 0)?.takeRetainedValue() as? Data,
+              address.count == 6,
+              address != Data(repeating: 0, count: 6),
+              address != Data([0x02, 0, 0, 0, 0, 0]) else { return nil }
+        return address.map { String(format: "%02X", $0) }.joined()
     }
 
     private func getSerialNumber() -> String? {

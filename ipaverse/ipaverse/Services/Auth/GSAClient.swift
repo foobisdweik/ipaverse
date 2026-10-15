@@ -104,8 +104,9 @@ final class GSAClient {
         let idmsToken = (account["GsIdmsToken"] as? String) ?? ""
 
         // Detect 2FA requirement from the complete Status.
-        if let status = completeResponse["Status"] as? [String: Any],
-           let au = status["au"] as? String, !au.isEmpty {
+        let status = completeResponse["Status"] as? [String: Any] ?? [:]
+        switch Self.secondaryAuth(in: status) {
+        case .requestCode(let au):
             print("🔐 [GSA] secondary auth required: \(au)")
             let identity = Data("\(dsid):\(idmsToken)".utf8).base64EncodedString()
             // Request a verification code. For accounts signed in on an Apple device
@@ -113,6 +114,12 @@ final class GSAClient {
             // get back the trusted phone number id + masked number for the UI.
             let info = try await requestTwoFactorCode(identityToken: identity)
             throw GSAError.needsTwoFactor(identityToken: identity, phoneId: info.phoneId, maskedPhone: info.maskedPhone)
+        case .codeAlreadySent:
+            print("🔐 [GSA] secondary auth required: code already sent to trusted devices (hsc 409)")
+            let identity = Data("\(dsid):\(idmsToken)".utf8).base64EncodedString()
+            throw GSAError.needsTwoFactor(identityToken: identity, phoneId: nil, maskedPhone: nil)
+        case .none:
+            break
         }
 
         guard !dsid.isEmpty, !idmsToken.isEmpty else {
@@ -142,8 +149,17 @@ final class GSAClient {
     /// AnisetteClientInfo). Other unparseable responses are not retried.
     private func send(request inner: [String: Any]) async throws -> [String: Any] {
         let maxAttempts = 2
-        for attempt in 1...maxAttempts {
-            let headers = try await anisette.headers()
+        var attempt = 1
+        var resynced: [String: String]?
+        var didResync = false
+        while attempt <= maxAttempts {
+            let headers: [String: String]
+            if let fresh = resynced {
+                headers = fresh
+                resynced = nil
+            } else {
+                headers = try await anisette.headers()
+            }
             var requestBody = inner
             requestBody["cpd"] = clientProvidedData(headers: headers)
             let body: [String: Any] = ["Header": ["Version": "1.0.1"], "Request": requestBody]
@@ -164,9 +180,21 @@ final class GSAClient {
                 if isTransient, attempt < maxAttempts {
                     print("🔐 [GSA] transient response (HTTP \(statusCode)) on attempt \(attempt) — retrying")
                     try await Task.sleep(nanoseconds: 1_500_000_000)
+                    attempt += 1
                     continue
                 }
                 throw GSAError.invalidResponse("unparseable GsService2 body (HTTP \(statusCode))")
+            }
+
+            // hsc 434: GSA does not trust the anisette data yet and sends resync data (the SIM).
+            // The anisette server turns the SIM into corrected headers, and the request is sent
+            // once more. The resync does not count as a transient retry.
+            if !didResync, let sim = Self.resyncSIM(in: responseDict),
+               let fresh = try await anisette.resyncedHeaders(sim: sim) {
+                print("🔐 [GSA] anisette resync required (hsc 434) — retrying with resynced headers")
+                didResync = true
+                resynced = fresh
+                continue
             }
 
             if let status = responseDict["Status"] as? [String: Any],
@@ -183,6 +211,32 @@ final class GSAClient {
         }
 
         throw GSAError.invalidResponse("unparseable GsService2 body")
+    }
+
+    enum SecondaryAuth: Equatable {
+        case none
+        /// `au` names a second factor, and the client must ask Apple to send a code.
+        case requestCode(String)
+        /// hsc 409 without `au`: Apple already pushed a code to the trusted devices
+        /// ("sign in to a new device"). Requesting another code is not needed.
+        case codeAlreadySent
+    }
+
+    static func secondaryAuth(in status: [String: Any]) -> SecondaryAuth {
+        if let au = status["au"] as? String, !au.isEmpty { return .requestCode(au) }
+        if (status["hsc"] as? NSNumber)?.intValue == 409 { return .codeAlreadySent }
+        return .none
+    }
+
+    /// The base64 SIM (`X-Apple-I-MD-DATA`) from a response whose Status has hsc 434, or nil.
+    static func resyncSIM(in response: [String: Any]) -> String? {
+        guard let status = response["Status"] as? [String: Any],
+              (status["hsc"] as? NSNumber)?.intValue == 434 else { return nil }
+        switch status["X-Apple-I-MD-DATA"] {
+        case let data as Data: return data.isEmpty ? nil : data.base64EncodedString()
+        case let text as String: return text.isEmpty ? nil : text
+        default: return nil
+        }
     }
 
     // MARK: - Two-factor verification
